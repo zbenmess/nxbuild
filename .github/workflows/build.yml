@@ -1,0 +1,138 @@
+name: Build nxnative IPA
+
+# Lancement manuel : onglet Actions > Build nxnative IPA > Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "Nom de l'app (optionnel, ex. MarioWonder)"
+        required: false
+        default: ""
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+
+jobs:
+  build:
+    runs-on: macos-26          # Mac M1 gratuit, Xcode 26 préinstallé
+    timeout-minutes: 350       # maximum autorisé par GitHub
+
+    steps:
+      - name: Libérer le disque (Xcode inutilisés, simulateurs)
+        run: |
+          set -eu
+          CURRENT="$(realpath "$(xcode-select -p)/../..")"
+          echo "Xcode conservé : $CURRENT"
+          for x in /Applications/Xcode*.app; do
+            [ -L "$x" ] && continue
+            [ "$(realpath "$x")" = "$CURRENT" ] && continue
+            sudo rm -rf "$x"
+          done
+          sudo xcrun simctl runtime delete all >/dev/null 2>&1 || true
+          sudo rm -rf "$HOME/Library/Developer/CoreSimulator" >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Installer les outils
+        run: |
+          set -eu
+          brew install xcodegen zstd spirv-cross megatools
+          command -v dotnet >/dev/null || brew install --cask dotnet-sdk
+          dotnet --version
+          # Depuis Xcode 26 le compilateur Metal est un composant à part
+          sudo xcodebuild -downloadComponent MetalToolchain || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Dépendances Python
+        run: python3 -m pip install --upgrade pip lz4 capstone fonttools gdown
+
+      - name: Récupérer nxnative
+        run: git clone --depth 1 --recurse-submodules https://github.com/seedds/nxnative.git "$HOME/nxnative"
+
+      - name: Écrire prod.keys (secret PROD_KEYS_URL ou PROD_KEYS)
+        env:
+          PROD_KEYS_URL: ${{ secrets.PROD_KEYS_URL }}
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+        run: |
+          set -eu
+          mkdir -p "$HOME/keys"
+          if [ -n "$PROD_KEYS_URL" ]; then
+            case "$PROD_KEYS_URL" in
+              *drive.google.com*)      gdown --fuzzy -O "$HOME/keys/prod.keys" "$PROD_KEYS_URL" ;;
+              *mega.nz*|*mega.co.nz*)  megadl --path "$HOME/keys/prod.keys" "$PROD_KEYS_URL" ;;
+              *)                       curl -fL -o "$HOME/keys/prod.keys" "$PROD_KEYS_URL" ;;
+            esac
+          elif [ -n "$PROD_KEYS" ]; then
+            printf '%s\n' "$PROD_KEYS" > "$HOME/keys/prod.keys"
+          else
+            echo "Secret PROD_KEYS_URL ou PROD_KEYS manquant"; exit 1
+          fi
+          echo "Clés lues : $(grep -c '=' "$HOME/keys/prod.keys")"
+
+      - name: Télécharger les NSP/XCI (secret SOURCE_LINKS, un lien par ligne)
+        env:
+          SOURCE_LINKS: ${{ secrets.SOURCE_LINKS }}
+        run: |
+          set -eu
+          [ -n "$SOURCE_LINKS" ] || { echo "Secret SOURCE_LINKS manquant"; exit 1; }
+          mkdir -p "$HOME/Games/game" && cd "$HOME/Games/game"
+          printf '%s\n' "$SOURCE_LINKS" | while IFS= read -r url; do
+            url="$(printf '%s' "$url" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -z "$url" ] && continue
+            echo "Téléchargement : $url"
+            case "$url" in
+              *mega.nz*|*mega.co.nz*)            megadl "$url" ;;
+              *drive.google.com/drive/folders*)  gdown --folder "$url" ;;
+              *drive.google.com*)                gdown --fuzzy "$url" ;;
+              *)                                 curl -fL -O -J "$url" ;;
+            esac
+          done
+          echo "Fichiers récupérés :"
+          find . -type f \( -iname '*.nsp' -o -iname '*.xci' \) -exec ls -lh {} \;
+          df -h /
+
+      - name: Construire l'IPA
+        env:
+          APP_NAME: ${{ github.event.inputs.app_name }}
+        run: |
+          set -eu
+          FIRST="$(find "$HOME/Games/game" -type f \( -iname '*.nsp' -o -iname '*.xci' \) | head -n 1)"
+          [ -n "$FIRST" ] || { echo "Aucun NSP/XCI téléchargé"; exit 1; }
+          GAME_DIR="$(dirname "$FIRST")"
+          echo "Dossier du jeu : $GAME_DIR"
+          cd "$HOME/nxnative"
+          if [ -n "$APP_NAME" ]; then
+            python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" -k "$HOME/keys/prod.keys" --app-name "$APP_NAME"
+          else
+            python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" -k "$HOME/keys/prod.keys"
+          fi
+          IPA="$(find "$GAME_DIR" -maxdepth 1 -iname '*.ipa' | head -n 1)"
+          if [ -z "$IPA" ]; then
+            echo "Pas d'IPA produit (jeu non supporté ? regarde le survey dans le dossier du jeu)"
+            ls -la "$GAME_DIR"
+            exit 1
+          fi
+          ls -lh "$IPA"
+          echo "IPA=$IPA" >> "$GITHUB_ENV"
+
+      - name: Envoyer l'IPA (MEGA si MEGA_EMAIL/MEGA_PASSWORD, sinon gofile.io)
+        env:
+          MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
+          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
+        run: |
+          set -eu
+          NAME="$(basename "$IPA")"
+          if [ -n "$MEGA_EMAIL" ] && [ -n "$MEGA_PASSWORD" ]; then
+            megamkdir --username "$MEGA_EMAIL" --password "$MEGA_PASSWORD" /Root/nxnative || true
+            megaput --username "$MEGA_EMAIL" --password "$MEGA_PASSWORD" --path /Root/nxnative "$IPA"
+            echo "### IPA déposé dans ton MEGA : nxnative/$NAME" >> "$GITHUB_STEP_SUMMARY"
+          else
+            RESP="$(curl -sS -F "file=@$IPA" https://upload.gofile.io/uploadfile)"
+            echo "$RESP"
+            LINK="$(printf '%s' "$RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin)["data"]["downloadPage"])')"
+            echo "### IPA à télécharger : $LINK" >> "$GITHUB_STEP_SUMMARY"
+            echo "Lien : $LINK"
+          fi
