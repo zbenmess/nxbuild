@@ -50,6 +50,14 @@ jobs:
           brew install xcodegen zstd spirv-cross megatools
           command -v dotnet >/dev/null || brew install --cask dotnet-sdk
           dotnet --version
+          dotnet --list-runtimes
+          # Le runner installe .NET hors de /usr/local/share/dotnet : les outils compilés
+          # par nxnative (nx_extract…) doivent savoir où est le runtime.
+          DOTNET_ROOT="$(cd "$(dirname "$(readlink -f "$(command -v dotnet)")")" && pwd)"
+          echo "DOTNET_ROOT=$DOTNET_ROOT" >> "$GITHUB_ENV"
+          echo "DOTNET_ROOT_ARM64=$DOTNET_ROOT" >> "$GITHUB_ENV"
+          [ -e /usr/local/share/dotnet ] || sudo ln -s "$DOTNET_ROOT" /usr/local/share/dotnet
+          echo "DOTNET_ROOT=$DOTNET_ROOT"
           # Depuis Xcode 26 le compilateur Metal est un composant à part
           sudo xcodebuild -downloadComponent MetalToolchain || true
 
