@@ -19,6 +19,17 @@ jobs:
     timeout-minutes: 350       # maximum autorisé par GitHub
 
     steps:
+      - name: Vérifier les secrets avant de consommer du quota
+        env:
+          PROD_KEYS_URL: ${{ secrets.PROD_KEYS_URL }}
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          SOURCE_LINKS: ${{ secrets.SOURCE_LINKS }}
+        run: |
+          set -eu
+          [ -n "$PROD_KEYS_URL$PROD_KEYS" ] || { echo "Secret PROD_KEYS_URL (ou PROD_KEYS) manquant"; exit 1; }
+          [ -n "$SOURCE_LINKS" ] || { echo "Secret SOURCE_LINKS manquant"; exit 1; }
+          echo "Secrets présents."
+
       - name: Libérer le disque (Xcode inutilisés, simulateurs)
         run: |
           set -eu
@@ -59,9 +70,10 @@ jobs:
         run: |
           set -eu
           mkdir -p "$HOME/keys"
+          gdrive_id() { printf '%s' "$1" | sed -n -e 's#.*/d/\([^/?]*\).*#\1#p' -e 's#.*[?&]id=\([^&]*\).*#\1#p' | head -n 1; }
           if [ -n "$PROD_KEYS_URL" ]; then
             case "$PROD_KEYS_URL" in
-              *drive.google.com*)      gdown --fuzzy -O "$HOME/keys/prod.keys" "$PROD_KEYS_URL" ;;
+              *drive.google.com*)      ID="$(gdrive_id "$PROD_KEYS_URL")"; gdown -O "$HOME/keys/prod.keys" "${ID:-$PROD_KEYS_URL}" ;;
               *mega.nz*|*mega.co.nz*)  megadl --path "$HOME/keys/prod.keys" "$PROD_KEYS_URL" ;;
               *)                       curl -fL -o "$HOME/keys/prod.keys" "$PROD_KEYS_URL" ;;
             esac
@@ -79,6 +91,7 @@ jobs:
           set -eu
           [ -n "$SOURCE_LINKS" ] || { echo "Secret SOURCE_LINKS manquant"; exit 1; }
           mkdir -p "$HOME/Games/game" && cd "$HOME/Games/game"
+          gdrive_id() { printf '%s' "$1" | sed -n -e 's#.*/d/\([^/?]*\).*#\1#p' -e 's#.*[?&]id=\([^&]*\).*#\1#p' | head -n 1; }
           printf '%s\n' "$SOURCE_LINKS" | while IFS= read -r url; do
             url="$(printf '%s' "$url" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
             [ -z "$url" ] && continue
@@ -86,7 +99,7 @@ jobs:
             case "$url" in
               *mega.nz*|*mega.co.nz*)            megadl "$url" ;;
               *drive.google.com/drive/folders*)  gdown --folder "$url" ;;
-              *drive.google.com*)                gdown --fuzzy "$url" ;;
+              *drive.google.com*)                ID="$(gdrive_id "$url")"; gdown "${ID:-$url}" ;;
               *)                                 curl -fL -O -J "$url" ;;
             esac
           done
