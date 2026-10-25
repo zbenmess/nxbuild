@@ -30,19 +30,11 @@ jobs:
           [ -n "$SOURCE_LINKS" ] || { echo "Secret SOURCE_LINKS manquant"; exit 1; }
           echo "Secrets présents."
 
-      - name: Libérer le disque (Xcode inutilisés, simulateurs)
+      - name: État du disque (assez de place, aucun nettoyage, les simulateurs font partie de la plateforme iOS)
         run: |
-          set -eu
-          CURRENT="$(realpath "$(xcode-select -p)/../..")"
-          echo "Xcode conservé : $CURRENT"
-          for x in /Applications/Xcode*.app; do
-            [ -L "$x" ] && continue
-            [ "$(realpath "$x")" = "$CURRENT" ] && continue
-            sudo rm -rf "$x"
-          done
-          sudo xcrun simctl runtime delete all >/dev/null 2>&1 || true
-          sudo rm -rf "$HOME/Library/Developer/CoreSimulator" >/dev/null 2>&1 || true
           df -h /
+          xcode-select -p
+          xcrun simctl runtime list 2>/dev/null || true
 
       - name: Installer les outils
         run: |
@@ -60,6 +52,10 @@ jobs:
           echo "DOTNET_ROOT=$DOTNET_ROOT"
           # Depuis Xcode 26 le compilateur Metal est un composant à part
           sudo xcodebuild -downloadComponent MetalToolchain || true
+          # La plateforme iOS (SDK + runtime) doit être présente pour xcodebuild "Any iOS Device"
+          if ! xcrun simctl runtime list 2>/dev/null | grep -q "iOS"; then
+            sudo xcodebuild -downloadPlatform iOS
+          fi
 
       - uses: actions/setup-python@v5
         with:
