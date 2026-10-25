@@ -57,11 +57,17 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Dépendances Python
-        run: python3 -m pip install --upgrade pip lz4 capstone fonttools gdown
-
       - name: Récupérer nxnative
         run: git clone --depth 1 --recurse-submodules https://github.com/seedds/nxnative.git "$HOME/nxnative"
+
+      - name: Dépendances Python
+        run: |
+          set -eu
+          python3 -m pip install --upgrade pip lz4 capstone fonttools backports.zstd gdown
+          # si nxnative publie un requirements.txt, on le respecte aussi
+          for f in "$HOME/nxnative/requirements.txt" "$HOME/nxnative/scripts/requirements.txt"; do
+            if [ -f "$f" ]; then python3 -m pip install -r "$f"; fi
+          done
 
       - name: Écrire prod.keys (secret PROD_KEYS_URL ou PROD_KEYS)
         env:
