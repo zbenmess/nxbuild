@@ -43,6 +43,27 @@ jobs:
       - name: Récupérer nxnative
         run: git clone --depth 1 --recurse-submodules https://github.com/seedds/nxnative.git "$HOME/nxnative"
 
+      - name: Compatibilité Xcode 26 (garde SDK sur une ligne iOS 27 de nxnative)
+        run: |
+          set -eu
+          python3 - <<'EOF'
+          from pathlib import Path
+          # nxnative vise Xcode 27.1 : une ligne de DmGamepad.m utilise une API qui n'existe que dans le SDK iOS 27
+          # (CMMotionManager.deviceMotionBody) sans garde de compilation, ce qui casse xcodebuild avec Xcode 26.
+          # On l'entoure de #if defined(__IPHONE_27_0), comme front_ios.m le fait déjà : avec le SDK 27 la garde
+          # est vraie et ne change rien ; avec le SDK 26 la ligne saute et le gyro du téléphone suit le chemin d'avant iOS 27.
+          p = Path.home() / 'nxnative/dm/ios/Sources/DmGamepad.m'
+          lines = p.read_text().splitlines(keepends=True)
+          out, patched = [], 0
+          for i, l in enumerate(lines):
+              if 'deviceMotionBody = body' in l and not (i and lines[i-1].lstrip().startswith('#if')):
+                  out += ['#if defined(__IPHONE_27_0)   // nxbuild : API du SDK iOS 27 seulement\n', l, '#endif\n']; patched += 1
+              else:
+                  out.append(l)
+          if patched: p.write_text(''.join(out))
+          print('DmGamepad.m :', f'{patched} ligne(s) protegee(s) par une garde SDK iOS 27' if patched else 'rien a patcher (deja corrige en amont)')
+          EOF
+
       - name: Installer les outils (liste connue + ce que le README de nxnative demande aujourd'hui)
         run: |
           set -eu
