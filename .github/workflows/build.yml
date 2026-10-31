@@ -47,6 +47,11 @@ jobs:
         run: |
           set -eu
           README="$HOME/nxnative/README.md"
+          # Xcode : nxnative exige le compilateur Metal d'une version précise (dm/gfx/tools/dmsh_chain.lock, aujourd'hui Xcode 27.1).
+          # On prend le Xcode le plus récent du runner ; si son compilateur n'est pas le bon, le build passera --allow-other-metal (contrôle plus bas).
+          NEWEST="$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -n 1)"
+          sudo xcode-select -s "$NEWEST"
+          echo "Xcode sélectionné : $NEWEST ($(xcodebuild -version | head -n 1))"
           # nxnative change ses dépendances au fil des semaines : on lit sa ligne "brew install" du jour
           EXTRA="$(grep -E '^brew install [a-z0-9@._ -]+$' "$README" | grep -v -- '--cask' | sed 's/^brew install //' | tr '\n' ' ' || true)"
           echo "Paquets demandés par le README : ${EXTRA:-aucun}"
@@ -95,6 +100,18 @@ jobs:
           [ -z "$MISSING" ] || { echo "Outils manquants :$MISSING -> à ajouter à la ligne brew install du workflow"; exit 1; }
           python3 -c "import lz4.block, capstone, fontTools, nsz, backports.zstd; assert capstone.cs_version()[0] == 5, 'capstone 5.x requis'" || { echo "Module Python manquant ou mauvaise version (voir l'erreur ci-dessus) -> à corriger sur la ligne pip du workflow"; exit 1; }
           echo "OK : outils ($TOOLS) et modules Python (lz4, capstone 5, fontTools, nsz, backports.zstd) présents."
+          # Compilateur Metal : celui que les shaders de nxnative ont été testés avec (dmsh_chain.lock) ou pas ?
+          WANT="$(awk -F'\t' '$1=="metal_iphoneos"{print $2}' dm/gfx/tools/dmsh_chain.lock 2>/dev/null || true)"
+          HAVE="$(xcrun -sdk iphoneos metal --version 2>/dev/null | head -n 1 || true)"
+          echo "Metal attendu par nxnative : ${WANT:-inconnu}"
+          echo "Metal de ce runner        : ${HAVE:-introuvable}"
+          if [ -n "$WANT" ] && [ "$HAVE" = "$WANT" ]; then
+            echo "ALLOW_METAL=" >> "$GITHUB_ENV"
+            echo "Compilateur identique : build normal."
+          else
+            echo "ALLOW_METAL=--allow-other-metal" >> "$GITHUB_ENV"
+            echo "Compilateur différent (GitHub n'a pas encore ce Xcode) : le build passera --allow-other-metal. nxnative prévient que le rendu peut être imparfait."
+          fi
 
       - name: Écrire prod.keys (secret PROD_KEYS_URL ou PROD_KEYS)
         env:
@@ -151,9 +168,9 @@ jobs:
           echo "Dossier du jeu : $GAME_DIR"
           cd "$HOME/nxnative"
           if [ -n "$APP_NAME" ]; then
-            python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" -k "$HOME/keys/prod.keys" --app-name "$APP_NAME"
+            python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" -k "$HOME/keys/prod.keys" ${ALLOW_METAL:-} --app-name "$APP_NAME"
           else
-            python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" -k "$HOME/keys/prod.keys"
+            python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" -k "$HOME/keys/prod.keys" ${ALLOW_METAL:-}
           fi
           IPA="$(find "$GAME_DIR" -maxdepth 1 -iname '*.ipa' | head -n 1)"
           if [ -z "$IPA" ]; then
