@@ -1,1 +1,187 @@
+name: Build Switch 2 IPA (fork nxnative)
 
+# Lancement manuel : onglet Actions > Build Switch 2 IPA > Run workflow
+# Jeux Switch 2 uniquement : depuis un .nup (ou un dossier base/exefs + base/romfs), sans prod.keys.
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Dépôt à utiliser (fork du jeu, ou nxnative d'origine)"
+        required: false
+        default: "https://github.com/cheemu21/kid-with-sword-remake.git"
+      ref:
+        description: "Tag ou branche à construire (vide = branche par défaut)"
+        required: false
+        default: "x9"
+      app_name:
+        description: "Nom de l'app (optionnel)"
+        required: false
+        default: ""
+      extra_args:
+        description: "Options supplémentaires du script (laisser vide sauf consigne)"
+        required: false
+        default: ""
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+
+jobs:
+  build:
+    runs-on: xcode-27          # image macOS 27 de GitHub : Xcode 27.2 présent (préversion)
+    timeout-minutes: 195       # ~1 950 minutes facturées : le quota mensuel gratuit est de 2 000
+
+    steps:
+      - name: Vérifier les secrets avant de consommer du quota
+        env:
+          SOURCE_LINKS: ${{ secrets.SOURCE_LINKS }}
+        run: |
+          set -eu
+          [ -n "$SOURCE_LINKS" ] || { echo "Secret SOURCE_LINKS manquant (lien du .nup)"; exit 1; }
+          echo "Secrets présents."
+
+      - uses: actions/checkout@v4   # pour lire env.txt à la racine du dépôt nxbuild
+
+      - name: Sélectionner Xcode 27.2
+        run: |
+          set -eu
+          ls /Applications | grep -i xcode || true
+          sudo xcode-select -s /Applications/Xcode_27.2.app
+          xcodebuild -version
+          sw_vers
+          df -h /
+
+      - name: Installer les outils
+        run: |
+          set -eu
+          brew install xcodegen zstd glslang megatools rclone
+          command -v dotnet >/dev/null || brew install --cask dotnet-sdk
+          dotnet --version
+          DOTNET_ROOT="$(cd "$(dirname "$(readlink -f "$(command -v dotnet)")")" && pwd)"
+          echo "DOTNET_ROOT=$DOTNET_ROOT" >> "$GITHUB_ENV"
+          echo "DOTNET_ROOT_ARM64=$DOTNET_ROOT" >> "$GITHUB_ENV"
+          [ -e /usr/local/share/dotnet ] || sudo ln -s "$DOTNET_ROOT" /usr/local/share/dotnet
+          # Compilateur Metal et plateforme iOS (composants séparés depuis Xcode 26)
+          sudo xcodebuild -downloadComponent MetalToolchain || true
+          if ! xcrun simctl runtime list 2>/dev/null | grep -q "iOS"; then
+            sudo xcodebuild -downloadPlatform iOS
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Récupérer le dépôt nxnative (fork)
+        env:
+          REPO: ${{ github.event.inputs.repo }}
+          REF: ${{ github.event.inputs.ref }}
+        run: |
+          set -eu
+          REPO="${REPO:-https://github.com/cheemu21/kid-with-sword-remake.git}"
+          if [ -n "$REF" ]; then
+            git clone --depth 1 --branch "$REF" --recurse-submodules "$REPO" "$HOME/nxnative"
+          else
+            git clone --depth 1 --recurse-submodules "$REPO" "$HOME/nxnative"
+          fi
+          cd "$HOME/nxnative" && git log -1 --format='%h %cd %s' --date=short
+
+      - name: Dépendances Python
+        run: |
+          set -eu
+          python3 -m pip install --upgrade pip gdown lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; python_version < '3.14'"
+          for f in "$HOME/nxnative/requirements.txt" "$HOME/nxnative/scripts/requirements.txt"; do
+            if [ -f "$f" ]; then python3 -m pip install -r "$f"; fi
+          done
+
+      - name: Télécharger le jeu (secret SOURCE_LINKS, un lien par ligne)
+        env:
+          SOURCE_LINKS: ${{ secrets.SOURCE_LINKS }}
+        run: |
+          set -eu
+          mkdir -p "$HOME/Games/game" && cd "$HOME/Games/game"
+          gdrive_id() { printf '%s' "$1" | sed -n -e 's#.*/d/\\([^/?]*\\).*#\\1#p' -e 's#.*[?&]id=\\([^&]*\\).*#\\1#p' | head -n 1; }
+          printf '%s\\n' "$SOURCE_LINKS" | while IFS= read -r url; do
+            url="$(printf '%s' "$url" | tr -d '\\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -z "$url" ] && continue
+            echo "Téléchargement : $url"
+            case "$url" in
+              *mega.nz*|*mega.co.nz*)            megadl "$url" ;;
+              *drive.google.com/drive/folders*)  gdown --folder "$url" ;;
+              *drive.google.com*)                ID="$(gdrive_id "$url")"; gdown "${ID:-$url}" ;;
+              *)                                 curl -fL -O -J "$url" ;;
+            esac
+          done
+          echo "Fichiers récupérés :"
+          find . -type f \\( -iname '*.nup' -o -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \\) -exec ls -lh {} \\;
+          df -h /
+
+      - name: Construire l'IPA
+        env:
+          APP_NAME: ${{ github.event.inputs.app_name }}
+          EXTRA_ARGS: ${{ github.event.inputs.extra_args }}
+        run: |
+          set -eu
+          GAME="$(find "$HOME/Games/game" -type f \\( -iname '*.nup' -o -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \\) | head -n 1)"
+          if [ -z "$GAME" ]; then
+            # dossier de dump (base/exefs, base/romfs) ?
+            if [ -d "$HOME/Games/game" ] && find "$HOME/Games/game" -type d -iname exefs | grep -q .; then
+              GAME="$HOME/Games/game"
+            else
+              echo "Aucun .nup/.nsp/.xci ni dossier exefs téléchargé"; exit 1
+            fi
+          fi
+          GAME_DIR="$GAME"; [ -d "$GAME" ] || GAME_DIR="$(dirname "$GAME")"
+          echo "Jeu : $GAME"
+          cd "$HOME/nxnative"
+          echo "----- options du script -----"
+          python3 scripts/build_ipa_from_nsp.py -h || true
+          echo "-----------------------------"
+          ENV_ARGS=""
+          if [ -f "$GITHUB_WORKSPACE/env.txt" ]; then
+            cp "$GITHUB_WORKSPACE/env.txt" "$GAME_DIR/env.txt"
+            echo "env.txt fourni :"; cat "$GAME_DIR/env.txt"
+            if python3 scripts/build_ipa_from_nsp.py -h 2>/dev/null | grep -q -- '--env'; then
+              ENV_ARGS="--env $GAME_DIR/env.txt"
+            fi
+          fi
+          NAME_ARGS=""
+          [ -n "$APP_NAME" ] && NAME_ARGS="--app-name $APP_NAME"
+          # shellcheck disable=SC2086
+          python3 scripts/build_ipa_from_nsp.py "$GAME" $ENV_ARGS $NAME_ARGS $EXTRA_ARGS
+          IPA="$(find "$GAME_DIR" -maxdepth 1 -iname '*.ipa' | head -n 1)"
+          [ -n "$IPA" ] || IPA="$(find "$HOME/Games" -iname '*.ipa' | head -n 1)"
+          if [ -z "$IPA" ]; then
+            echo "Pas d'IPA produit : regarde le survey / les logs du dossier du jeu"
+            ls -la "$GAME_DIR"
+            exit 1
+          fi
+          ls -lh "$IPA"
+          echo "IPA=$IPA" >> "$GITHUB_ENV"
+
+      - name: Envoyer l'IPA (Drive via RCLONE_DRIVE_TOKEN, sinon MEGA, sinon gofile.io)
+        env:
+          RCLONE_DRIVE_TOKEN: ${{ secrets.RCLONE_DRIVE_TOKEN }}
+          MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
+          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
+        run: |
+          set -eu
+          NAME="$(basename "$IPA")"
+          if [ -n "$RCLONE_DRIVE_TOKEN" ]; then
+            # Remote Drive défini par variables d'environnement : aucun fichier de config à écrire
+            export RCLONE_CONFIG_GDRIVE_TYPE=drive
+            export RCLONE_CONFIG_GDRIVE_SCOPE=drive
+            export RCLONE_CONFIG_GDRIVE_TOKEN="$RCLONE_DRIVE_TOKEN"
+            rclone copy "$IPA" gdrive:nxnative --drive-chunk-size 128M --transfers 1 --stats 30s --stats-one-line
+            rclone ls gdrive:nxnative | grep -F "$NAME"
+            echo "### IPA déposé dans ton Google Drive : nxnative/$NAME" >> "$GITHUB_STEP_SUMMARY"
+          elif [ -n "$MEGA_EMAIL" ] && [ -n "$MEGA_PASSWORD" ]; then
+            megamkdir --username "$MEGA_EMAIL" --password "$MEGA_PASSWORD" /Root/nxnative || true
+            megaput --username "$MEGA_EMAIL" --password "$MEGA_PASSWORD" --path /Root/nxnative "$IPA"
+            echo "### IPA déposé dans ton MEGA : nxnative/$NAME" >> "$GITHUB_STEP_SUMMARY"
+          else
+            RESP="$(curl -sS -F "file=@$IPA" https://upload.gofile.io/uploadfile)"
+            echo "$RESP"
+            LINK="$(printf '%s' "$RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin)["data"]["downloadPage"])')"
+            echo "### IPA à télécharger : $LINK" >> "$GITHUB_STEP_SUMMARY"
+            echo "Lien : $LINK"
+          fi
