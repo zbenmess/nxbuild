@@ -1,0 +1,136 @@
+name: Diagnostiquer le .nup
+
+# Lancement manuel : onglet Actions > Diagnostiquer le .nup > Run workflow
+# Tourne sur Linux : minutes comptées x1 (un build macOS compte x10). Aucun build, seulement des vérifications.
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Préparer le disque
+        run: |
+          sudo mkdir -p /mnt/w && sudo chown "$USER" /mnt/w
+          df -h / /mnt
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Outils (outil NUP de référence + lecteur du fork x9)
+        run: |
+          set -eu
+          python3 -m pip install --upgrade pip gdown "backports.zstd"
+          git clone --depth 1 https://github.com/a55uka/nup.git /mnt/w/nup
+          git clone --depth 1 --branch x9 https://github.com/cheemu21/kid-with-sword-remake.git /mnt/w/kws
+          python3 -m pip install /mnt/w/nup/tools/nup
+          nup --help | head -20
+
+      - name: Télécharger le .nup (secret SOURCE_LINKS)
+        env:
+          SOURCE_LINKS: ${{ secrets.SOURCE_LINKS }}
+        run: |
+          set -eu
+          mkdir -p /mnt/w/game && cd /mnt/w/game
+          gdrive_id() { printf '%s' "$1" | sed -n -e 's#.*/d/\([^/?]*\).*#\1#p' -e 's#.*[?&]id=\([^&]*\).*#\1#p' | head -n 1; }
+          printf '%s\n' "$SOURCE_LINKS" | while IFS= read -r url; do
+            url="$(printf '%s' "$url" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -z "$url" ] && continue
+            case "$url" in
+              *drive.google.com*) ID="$(gdrive_id "$url")"; gdown "${ID:-$url}" ;;
+              *)                  curl -fL -O -J "$url" ;;
+            esac
+          done
+          ls -l /mnt/w/game
+          F="$(find /mnt/w/game -iname '*.nup' | head -n 1)"
+          [ -n "$F" ] || { echo "Aucun .nup téléchargé"; exit 1; }
+          echo "F=$F" >> "$GITHUB_ENV"
+
+      - name: Empreinte SHA-256 du fichier téléchargé (à comparer avec la copie de l'iPhone)
+        run: |
+          set -eu
+          stat -c '%s octets' "$F"
+          sha256sum "$F" | tee /mnt/w/sha.txt
+          echo "### SHA-256 du .nup sur le runner : $(cut -d' ' -f1 /mnt/w/sha.txt)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: nup info (métadonnées, outil d'origine du fichier)
+        continue-on-error: true
+        run: nup info "$F"
+
+      - name: nup verify (outil de référence, toutes les empreintes)
+        continue-on-error: true
+        run: nup verify "$F"
+
+      - name: Analyse des fichiers abîmés (lecteur du fork)
+        run: |
+          set -eu
+          cat > /mnt/w/diag.py <<'PY'
+          import sys, hashlib, collections
+          sys.path.insert(0, '/mnt/w/kws/scripts')
+          import pack_nup as P
+          try: from compression import zstd
+          except ImportError: from backports import zstd
+
+          n = P.Nup(sys.argv[1]); mm = n.mm
+          parent = {}
+          for d, (_, first, count) in enumerate(n.dirs):
+              for s in n.slots[first:first + count]: parent[s] = d
+          def full(fi):
+              parts, d = [n.files[fi][0].decode(errors='replace')], parent.get(n.ndirs + fi)
+              while d is not None:
+                  nm = n.dirs[d][0].decode(errors='replace')
+                  if nm: parts.append(nm)
+                  d = parent.get(d)
+              return '/'.join(reversed(parts))
+          for k in n.packages:
+              print(f'paquet {k.index} : {P.KINDS[k.kind]}, version {k.version}, title {k.title_id:016X}')
+          by_sha = collections.defaultdict(list)
+          for i, f in enumerate(n.files): by_sha[f[2]].append(i)
+          class Sink:
+              def write(self, b): pass
+          stats, bad = collections.Counter(), []
+          for i, (name, size, sha, eoff, esz, codec) in enumerate(n.files):
+              if not size: stats['vide'] += 1; continue
+              try: n.copy(i, Sink()); stats['ok'] += 1
+              except P.Error: stats['KO'] += 1; bad.append(i)
+          print(f'\nfichiers : {len(n.files)} | sains : {stats["ok"]} | abîmés : {stats["KO"]} | vides : {stats["vide"]}')
+          if not bad:
+              print('VERDICT : aucun fichier abîmé sur le runner Linux ; le problème vient de l environnement de build'); sys.exit(0)
+          tags = collections.Counter()
+          for i in bad[:40]:
+              name, size, sha, eoff, esz, codec = n.files[i]
+              head = bytes(mm[eoff:eoff + min(esz, 1 << 20)])
+              info = [full(i), f'taille {size}', f'extent {esz}', 'zstd' if codec else 'brut', f'debut {head[:4]!r}']
+              if head and head.count(0) == len(head): info.append('ZONE A ZERO'); tags['zero'] += 1
+              if esz <= 256 << 20:
+                  raw = bytes(mm[eoff:eoff + esz])
+                  if hashlib.sha256(raw).digest() == sha: info.append('empreinte = octets compresses'); tags['conv'] += 1
+                  if codec:
+                      try:
+                          out = zstd.decompress(raw); h = hashlib.sha256(out).digest()
+                          info.append(f'decompresse {len(out)}')
+                          if h == sha: info.append('OK EN MULTI-TRAMES'); tags['multi'] += 1
+                          elif h in by_sha: info.append('= contenu de ' + full(by_sha[h][0])); tags['mix'] += 1
+                      except Exception as e: info.append(f'zstd : {e}'); tags['zstderr'] += 1
+                  elif hashlib.sha256(raw).digest() in by_sha:
+                      info.append('= contenu de ' + full(by_sha[hashlib.sha256(raw).digest()][0])); tags['mix'] += 1
+              print(' | '.join(info))
+          offs = sorted((n.files[i][3], n.files[i][3] + n.files[i][4]) for i in bad)
+          regions, cur = [], list(offs[0])
+          for a, b in offs[1:]:
+              if a <= cur[1] + (64 << 20): cur[1] = max(cur[1], b)
+              else: regions.append(cur); cur = [a, b]
+          regions.append(cur)
+          print(f'\nzones abîmées : {len(regions)}, de {offs[0][0]:,} à {offs[-1][1]:,} octets sur {len(mm):,}')
+          for a, b in regions[:10]: print(f'  {a:,} → {b:,}')
+          print('\nVERDICT :', 'zones remplies de zéros : copie ou téléchargement incomplet' if tags['zero'] else
+                'trames zstd multiples : défaut du programme qui a créé le .nup, contournable' if tags['multi'] else
+                'empreintes calculées sur les octets compressés : défaut du programme qui a créé le .nup, contournable' if tags['conv'] else
+                'contenus intervertis entre fichiers : défaut du programme qui a créé le .nup' if tags['mix'] else
+                'contenu différent de son empreinte : fichier abîmé à la création ou pendant un transfert')
+          PY
+          python3 /mnt/w/diag.py "$F" | tee /mnt/w/diag.txt
+          { echo '```'; tail -n 25 /mnt/w/diag.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
