@@ -30,6 +30,8 @@ jobs:
   build:
     runs-on: xcode-27          # image macOS 27 de GitHub : Xcode 27.2 présent (préversion)
     timeout-minutes: 195       # ~1 950 minutes facturées : le quota mensuel gratuit est de 2 000
+    permissions:
+      contents: write          # pour publier l'IPA en release GitHub avec le jeton automatique
 
     steps:
       - name: Vérifier les secrets avant de consommer du quota
@@ -99,9 +101,9 @@ jobs:
         run: |
           set -eu
           mkdir -p "$HOME/Games/game" && cd "$HOME/Games/game"
-          gdrive_id() { printf '%s' "$1" | sed -n -e 's#.*/d/\\([^/?]*\\).*#\\1#p' -e 's#.*[?&]id=\\([^&]*\\).*#\\1#p' | head -n 1; }
-          printf '%s\\n' "$SOURCE_LINKS" | while IFS= read -r url; do
-            url="$(printf '%s' "$url" | tr -d '\\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          gdrive_id() { printf '%s' "$1" | sed -n -e 's#.*/d/\([^/?]*\).*#\1#p' -e 's#.*[?&]id=\([^&]*\).*#\1#p' | head -n 1; }
+          printf '%s\n' "$SOURCE_LINKS" | while IFS= read -r url; do
+            url="$(printf '%s' "$url" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
             [ -z "$url" ] && continue
             echo "Téléchargement : $url"
             case "$url" in
@@ -112,7 +114,7 @@ jobs:
             esac
           done
           echo "Fichiers récupérés :"
-          find . -type f \\( -iname '*.nup' -o -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \\) -exec ls -lh {} \\;
+          find . -type f \( -iname '*.nup' -o -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) -exec ls -lh {} \;
           df -h /
 
       - name: Construire l'IPA
@@ -121,7 +123,7 @@ jobs:
           EXTRA_ARGS: ${{ github.event.inputs.extra_args }}
         run: |
           set -eu
-          GAME="$(find "$HOME/Games/game" -type f \\( -iname '*.nup' -o -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \\) | head -n 1)"
+          GAME="$(find "$HOME/Games/game" -type f \( -iname '*.nup' -o -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) | head -n 1)"
           if [ -z "$GAME" ]; then
             # dossier de dump (base/exefs, base/romfs) ?
             if [ -d "$HOME/Games/game" ] && find "$HOME/Games/game" -type d -iname exefs | grep -q .; then
@@ -158,30 +160,29 @@ jobs:
           ls -lh "$IPA"
           echo "IPA=$IPA" >> "$GITHUB_ENV"
 
-      - name: Envoyer l'IPA (Drive via RCLONE_DRIVE_TOKEN, sinon MEGA, sinon gofile.io)
+      - name: Publier l'IPA (Drive si RCLONE_DRIVE_TOKEN, sinon release GitHub en morceaux de 1,9 Go)
         env:
           RCLONE_DRIVE_TOKEN: ${{ secrets.RCLONE_DRIVE_TOKEN }}
-          MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
-          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
           NAME="$(basename "$IPA")"
+          SIZE="$(stat -f %z "$IPA")"
           if [ -n "$RCLONE_DRIVE_TOKEN" ]; then
-            # Remote Drive défini par variables d'environnement : aucun fichier de config à écrire
             export RCLONE_CONFIG_GDRIVE_TYPE=drive
             export RCLONE_CONFIG_GDRIVE_SCOPE=drive
             export RCLONE_CONFIG_GDRIVE_TOKEN="$RCLONE_DRIVE_TOKEN"
             rclone copy "$IPA" gdrive:nxnative --drive-chunk-size 128M --transfers 1 --stats 30s --stats-one-line
             rclone ls gdrive:nxnative | grep -F "$NAME"
-            echo "### IPA déposé dans ton Google Drive : nxnative/$NAME" >> "$GITHUB_STEP_SUMMARY"
-          elif [ -n "$MEGA_EMAIL" ] && [ -n "$MEGA_PASSWORD" ]; then
-            megamkdir --username "$MEGA_EMAIL" --password "$MEGA_PASSWORD" /Root/nxnative || true
-            megaput --username "$MEGA_EMAIL" --password "$MEGA_PASSWORD" --path /Root/nxnative "$IPA"
-            echo "### IPA déposé dans ton MEGA : nxnative/$NAME" >> "$GITHUB_STEP_SUMMARY"
+            echo "### IPA déposé dans ton Google Drive : nxnative/$NAME ($SIZE octets)" >> "$GITHUB_STEP_SUMMARY"
           else
-            RESP="$(curl -sS -F "file=@$IPA" https://upload.gofile.io/uploadfile)"
-            echo "$RESP"
-            LINK="$(printf '%s' "$RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin)["data"]["downloadPage"])')"
-            echo "### IPA à télécharger : $LINK" >> "$GITHUB_STEP_SUMMARY"
-            echo "Lien : $LINK"
+            command -v gh >/dev/null || brew install gh
+            PARTS="$RUNNER_TEMP/parts"; mkdir -p "$PARTS"
+            split -b 1900m "$IPA" "$PARTS/$NAME.part-"
+            ls -l "$PARTS"
+            TAG="ipa-$GITHUB_RUN_NUMBER"
+            printf 'IPA : %s\nTaille exacte : %s octets\n\nSur l’iPhone, dans a-Shell, dans le dossier des morceaux :\ncat *.part-* > jeu.ipa\n' "$NAME" "$SIZE" > "$RUNNER_TEMP/notes.md"
+            gh release create "$TAG" "$PARTS"/* --repo "$GITHUB_REPOSITORY" --title "$NAME (build $GITHUB_RUN_NUMBER)" --notes-file "$RUNNER_TEMP/notes.md"
+            N="$(ls "$PARTS" | wc -l | tr -d ' ')"
+            echo "### IPA publié en release GitHub $TAG : $N morceaux, $SIZE octets au total" >> "$GITHUB_STEP_SUMMARY"
           fi
